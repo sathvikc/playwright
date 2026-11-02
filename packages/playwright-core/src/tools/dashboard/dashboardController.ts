@@ -61,6 +61,29 @@ export type AnnotateResult =
   | { type: 'submitted', frames: SubmittedAnnotationFrame[], feedback: string }
   | { type: 'cancelled' };
 
+export type ControlResult =
+  | { type: 'free' }
+  | { type: 'released', message: string, actions: string[] };
+
+type UserAction =
+  | { kind: 'type', text: string }
+  | { kind: 'scroll' }
+  | { kind: 'other', description: string };
+
+type Control = {
+  context: api.BrowserContext;
+  actions: UserAction[];
+  waiters: Set<(result: ControlResult) => void>;
+};
+
+function renderUserAction(action: UserAction): string {
+  if (action.kind === 'type')
+    return `Typed ${JSON.stringify(action.text)}`;
+  if (action.kind === 'scroll')
+    return 'Scrolled the page';
+  return action.description;
+}
+
 export class DashboardConnection implements Transport {
   sendEvent?: (method: string, params: any) => void;
   close?: () => void;
@@ -75,6 +98,7 @@ export class DashboardConnection implements Transport {
   private _visible = true;
   private _pendingReveal: { sessionName?: string; workspaceDir?: string; pageId?: string } | undefined;
   private _pendingAnnotate: { resolve: (result: AnnotateResult) => void; dispose: () => void } | undefined;
+  private _control: Control | undefined;
 
   _recordingDir: string;
   _streams = new Map<string, { handle: fs.promises.FileHandle; path: string }>();
@@ -107,6 +131,8 @@ export class DashboardConnection implements Transport {
         this._attachedPage.dispose();
         this._attachedPage = undefined;
       }
+      if (this._control?.context === context)
+        this._releaseControl('');
     });
     this._provider.on(SessionProviderEvent.AttachRequested, page => { void this._switchAttachedTo(page); });
     this._provider.start();
@@ -123,6 +149,7 @@ export class DashboardConnection implements Transport {
     this._activeContextDebugger = undefined;
     this._pendingReveal = undefined;
     this._resolvePendingAnnotate({ type: 'cancelled' });
+    this._releaseControl('');
     for (const stream of this._streams.values()) {
       void stream.handle.close()
           .catch(() => {})
@@ -161,13 +188,16 @@ export class DashboardConnection implements Transport {
       return;
     const page = await wrapInternal(context, () => context.newPage());
     await this._switchAttachedTo(page);
+    this._recordUserAction({ kind: 'other', description: 'Opened a new tab' });
     this._pushTabs();
   }
 
   async closeTab(params: { browser: string; context: string; page: string }) {
     const page = this._provider.findPage(params);
-    if (page)
-      await wrapInternal(page, () => page.close({ reason: 'Closed in Dashboard' }));
+    if (!page)
+      return;
+    this._recordUserAction({ kind: 'other', description: `Closed the tab ${page.url()}` });
+    await wrapInternal(page, () => page.close({ reason: 'Closed in Dashboard' }));
   }
 
   async closeSession(params: { browser: string }) {
@@ -179,6 +209,75 @@ export class DashboardConnection implements Transport {
       return;
     this._visible = params.visible;
     await this._attachedPage?.setScreencastActive(params.visible);
+  }
+
+  async setControl(params: { control: boolean; message?: string }) {
+    if (!params.control) {
+      this._releaseControl(params.message ?? '');
+      return;
+    }
+    const context = this._attachedPage?.page.context();
+    if (context)
+      this._takeControl(context);
+  }
+
+  // Resolves at once when the user does not control the context, or when the user releases it.
+  waitForControl(contextGuid: string, signal: AbortSignal): Promise<ControlResult> {
+    const control = this._control;
+    if (!control || contextId(control.context) !== contextGuid || signal.aborted)
+      return Promise.resolve({ type: 'free' });
+    return new Promise<ControlResult>(resolve => {
+      const onAbort = () => {
+        control.waiters.delete(waiter);
+        this._emitAgentWaiting();
+        resolve({ type: 'free' });
+      };
+      const waiter = (result: ControlResult) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      };
+      control.waiters.add(waiter);
+      signal.addEventListener('abort', onAbort);
+      this._emitAgentWaiting();
+    });
+  }
+
+  hasControl(): boolean {
+    return !!this._control;
+  }
+
+  _recordUserAction(action: UserAction) {
+    const control = this._control;
+    if (!control || this._attachedPage?.page.context() !== control.context)
+      return;
+    const last = control.actions[control.actions.length - 1];
+    if (last?.kind === 'type' && action.kind === 'type')
+      last.text += action.text;
+    else if (last?.kind !== 'scroll' || action.kind !== 'scroll')
+      control.actions.push(action);
+  }
+
+  private _takeControl(context: api.BrowserContext) {
+    if (this._control?.context === context)
+      return;
+    this._releaseControl('');
+    this._control = { context, actions: [], waiters: new Set() };
+  }
+
+  private _releaseControl(message: string) {
+    const control = this._control;
+    if (!control)
+      return;
+    this._control = undefined;
+    const result: ControlResult = { type: 'released', message, actions: control.actions.map(renderUserAction) };
+    for (const waiter of control.waiters)
+      waiter(result);
+    if (control.waiters.size)
+      this._emitAgentWaiting();
+  }
+
+  private _emitAgentWaiting() {
+    this.sendEvent?.('agentWaiting', { waiting: !!this._control?.waiters.size });
   }
 
   async debuggerResume() {
@@ -404,6 +503,9 @@ export class DashboardConnection implements Transport {
     if (this._attachedPage === attached) {
       this._setActiveContextDebugger(this._contextDebuggerFor(page.context()));
       this._tryFireAnnotate();
+      // The user controls the session they look at.
+      if (this._control)
+        this._takeControl(page.context());
     }
   }
 
@@ -579,6 +681,7 @@ class AttachedPage {
   private _screencastRunning = false;
   private _recordingPath: string | null = null;
   private _disposed = false;
+  private _heldModifiers = new Set<string>();
 
   constructor(owner: DashboardConnection, page: api.Page) {
     this._owner = owner;
@@ -627,18 +730,22 @@ class AttachedPage {
   async navigate(params: { url: string }) {
     if (!params.url)
       return;
+    this._owner._recordUserAction({ kind: 'other', description: `Navigated to ${params.url}` });
     await wrapInternal(this._page, () => this._page.goto(params.url));
   }
 
   async back() {
+    this._owner._recordUserAction({ kind: 'other', description: 'Went back' });
     await wrapInternal(this._page, () => this._page.goBack());
   }
 
   async forward() {
+    this._owner._recordUserAction({ kind: 'other', description: 'Went forward' });
     await wrapInternal(this._page, () => this._page.goForward());
   }
 
   async reload() {
+    this._owner._recordUserAction({ kind: 'other', description: 'Reloaded the page' });
     await wrapInternal(this._page, () => this._page.reload());
   }
 
@@ -647,8 +754,28 @@ class AttachedPage {
   }
 
   async mousedown(params: { x: number; y: number; button?: 'left' | 'middle' | 'right' }) {
+    if (this._owner.hasControl()) {
+      // Record in input order, and do not delay the click: the element description arrives later.
+      const verb = params.button === 'right' ? 'Right-clicked' : params.button === 'middle' ? 'Middle-clicked' : 'Clicked';
+      const at = `at (${Math.round(params.x)}, ${Math.round(params.y)})`;
+      const action: UserAction = { kind: 'other', description: `${verb} ${at}` };
+      this._owner._recordUserAction(action);
+      void this._describeElementAt(params.x, params.y).then(target => action.description = `${verb} ${target} ${at}`);
+    }
     await wrapInternal(this._page, () => this._page.mouse.move(params.x, params.y));
     await wrapInternal(this._page, () => this._page.mouse.down({ button: params.button || 'left' }));
+  }
+
+  private async _describeElementAt(x: number, y: number): Promise<string> {
+    const description = await wrapInternal(this._page, () => this._page.evaluate(({ x, y }) => {
+      const element = document.elementFromPoint(x, y);
+      if (!element)
+        return '';
+      const label = element.getAttribute('aria-label') || (element as HTMLElement).innerText || element.getAttribute('placeholder') || element.getAttribute('title') || '';
+      const text = label.trim().replace(/\s+/g, ' ').slice(0, 60);
+      return `<${element.tagName.toLowerCase()}>` + (text ? ` ${JSON.stringify(text)}` : '');
+    }, { x, y })).catch(() => '');
+    return description || 'the page';
   }
 
   async mouseup(params: { x: number; y: number; button?: 'left' | 'middle' | 'right' }) {
@@ -657,15 +784,30 @@ class AttachedPage {
   }
 
   async wheel(params: { deltaX: number; deltaY: number }) {
+    this._owner._recordUserAction({ kind: 'scroll' });
     await wrapInternal(this._page, () => this._page.mouse.wheel(params.deltaX, params.deltaY));
   }
 
   async keydown(params: { key: string }) {
+    this._recordKey(params.key);
     await wrapInternal(this._page, () => this._page.keyboard.down(params.key));
   }
 
   async keyup(params: { key: string }) {
+    this._heldModifiers.delete(params.key);
     await wrapInternal(this._page, () => this._page.keyboard.up(params.key));
+  }
+
+  private _recordKey(key: string) {
+    if (kModifiers.includes(key)) {
+      this._heldModifiers.add(key);
+      return;
+    }
+    const shortcutModifiers = [...this._heldModifiers].filter(m => m !== 'Shift');
+    if (key.length === 1 && !shortcutModifiers.length)
+      this._owner._recordUserAction({ kind: 'type', text: key });
+    else
+      this._owner._recordUserAction({ kind: 'other', description: `Pressed ${[...this._heldModifiers, key].join('+')}` });
   }
 
   async startRecording() {
@@ -726,6 +868,8 @@ class AttachedPage {
     await this._startScreencast(page);
   }
 }
+
+const kModifiers = ['Shift', 'Control', 'Alt', 'Meta'];
 
 function browserId(browser: api.Browser): string {
   // eslint-disable-next-line no-restricted-syntax -- _guid is very conservative.

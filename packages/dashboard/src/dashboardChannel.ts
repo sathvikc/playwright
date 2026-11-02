@@ -52,6 +52,7 @@ export type DashboardChannelEvents = {
   apiCalls: { apiCalls: ApiCall[] };
   debuggerPaused: { paused: boolean };
   debuggerSource: { source: DebuggerSource | null };
+  agentWaiting: { waiting: boolean };
 };
 
 export type ApiCall = {
@@ -80,6 +81,8 @@ export interface DashboardChannel {
   newTab(params: { browser: string; context: string }): Promise<void>;
   closeSession(params: { browser: string }): Promise<void>;
   setVisible(params: { visible: boolean }): Promise<void>;
+  // While the user has control, agent commands on the session wait. Releasing sends the message to them.
+  setControl(params: { control: boolean; message?: string }): Promise<void>;
 
   navigate(params: { url: string }): Promise<void>;
   back(): Promise<void>;

@@ -103,6 +103,62 @@
   background: var(--color-canvas-subtle);
 }
 
+/* -- Control bar (shown while the user has control) -- */
+.control-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--color-border-muted);
+  background: rgb(var(--interactive-orange) / 0.12);
+}
+
+.control-status {
+  flex: none;
+  font-size: 12px;
+  color: var(--color-fg-muted);
+  white-space: nowrap;
+}
+
+.control-status.agent-waiting {
+  font-weight: 600;
+  color: var(--color-attention-fg);
+}
+
+.control-message {
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  max-height: 120px;
+  padding: 5px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  background: var(--color-canvas-default);
+  color: var(--color-fg-default);
+  border: 1px solid var(--color-border-default);
+  border-radius: 6px;
+  outline: none;
+}
+
+.control-message:focus {
+  border-color: var(--color-accent-fg);
+  box-shadow: 0 0 0 2px var(--color-accent-muted);
+}
+
+.control-release {
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--color-fg-on-emphasis);
+  background: rgb(var(--interactive-orange));
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 /* -- Browser window / chrome (wraps the screencast to look like a browser) -- */
 /* width / height are set via inline style so the window tightly inscribes
    the screencast aspect ratio instead of letting the image letterbox. */

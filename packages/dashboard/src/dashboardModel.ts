@@ -70,6 +70,9 @@ export type DashboardState = {
   // before the next action.
   debuggerPauseRequested: boolean;
   debuggerSource: DebuggerSource | null;
+  // Take control.
+  controlMessage: string;
+  agentWaiting: boolean;
 };
 
 type Listener = () => void;
@@ -89,6 +92,8 @@ const initialState: DashboardState = {
   debuggerPaused: false,
   debuggerPauseRequested: false,
   debuggerSource: null,
+  controlMessage: '',
+  agentWaiting: false,
 };
 
 export class DashboardModel {
@@ -110,6 +115,7 @@ export class DashboardModel {
     client.on('apiCalls', params => this._emit({ apiCalls: params.apiCalls }));
     client.on('debuggerPaused', params => this._emit({ debuggerPaused: params.paused, debuggerPauseRequested: params.paused ? false : this.state.debuggerPauseRequested }));
     client.on('debuggerSource', params => this._emit({ debuggerSource: params.source }));
+    client.on('agentWaiting', params => this._emit({ agentWaiting: params.waiting }));
   }
 
   subscribe(listener: Listener): () => void {
@@ -206,6 +212,10 @@ export class DashboardModel {
 
   enterInteractive() {
     void this._enterInteractive();
+  }
+
+  updateControlMessage(controlMessage: string) {
+    this._emit({ controlMessage });
   }
 
   enterAnnotate(initiator: 'cli' | 'user') {
@@ -459,7 +469,16 @@ export class DashboardModel {
   }
 
   private _emit(partial: Partial<DashboardState>) {
+    const wasInteractive = this.state.mode === 'interactive';
     this.state = { ...this.state, ...partial };
+    const interactive = this.state.mode === 'interactive';
+    if (!wasInteractive && interactive) {
+      void this._client.setControl({ control: true });
+    } else if (wasInteractive && !interactive) {
+      const message = this.state.controlMessage.trim();
+      this.state = { ...this.state, controlMessage: '' };
+      void this._client.setControl({ control: false, message });
+    }
     for (const listener of this._listeners)
       listener();
   }

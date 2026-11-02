@@ -32,7 +32,7 @@ import { RegistrySessionProvider } from './registrySessionProvider';
 import { IdentitySessionProvider } from './identitySessionProvider';
 
 import type * as api from '../../..';
-import type { AnnotateResult } from './dashboardController';
+import type { AnnotateResult, ControlResult } from './dashboardController';
 import type { SessionProvider } from './sessionProvider';
 
 // HMR: build-time flag — `true` in watch builds, `false` in release. esbuild
@@ -44,6 +44,7 @@ type DashboardServer = {
   url: string;
   reveal: (options: DashboardOptions) => void;
   triggerAnnotate: (signal: AbortSignal) => Promise<AnnotateResult>;
+  waitForControl: (contextGuid: string, signal: AbortSignal) => Promise<ControlResult>;
   close: () => Promise<void>;
 };
 
@@ -104,13 +105,22 @@ async function startDashboardServer(provider: SessionProvider, options: Dashboar
     return await Promise.race([...connections].map(c => c.emitAnnotate({ signal: cancellation })));
   };
 
+  const waitForControl = async (contextGuid: string, signal: AbortSignal): Promise<ControlResult> => {
+    for (const c of connections) {
+      const result = await c.waitForControl(contextGuid, signal);
+      if (result.type === 'released')
+        return result;
+    }
+    return { type: 'free' };
+  };
+
   const close = async () => {
     for (const c of connections)
       c.close?.();
     await httpServer.stop();
   };
   const url = redirectFromRoot ? httpServer.rootUrl('human-readable') : httpServer.urlPrefix('human-readable') + '/';
-  return { url, reveal, triggerAnnotate, close };
+  return { url, reveal, triggerAnnotate, waitForControl, close };
 }
 
 function attachDashboardStaticServer(httpServer: HttpServer, dashboardDir: string) {
@@ -210,6 +220,8 @@ type DashboardOptions = {
   pageId?: string;
   kill?: boolean;
   annotate?: boolean;
+  // Guid of a browser context. The reply comes when the user does not control it in the dashboard.
+  waitForControl?: string;
   port?: number;
   host?: string;
 };
@@ -341,7 +353,13 @@ function handleConnection(socket: net.Socket, statePromise: Promise<AppState>) {
       return;
     }
     const { page, server: dashboard } = await statePromise;
-    if (parsed.annotate) {
+    if (parsed.waitForControl) {
+      const cancellation = new AbortController();
+      socket.on('close', () => cancellation.abort());
+      socket.on('error', () => cancellation.abort());
+      const result = await dashboard.waitForControl(parsed.waitForControl, cancellation.signal);
+      socket.end(JSON.stringify(result));
+    } else if (parsed.annotate) {
       const cancellation = new AbortController();
       socket.on('close', () => cancellation.abort());
       socket.on('error', () => cancellation.abort());

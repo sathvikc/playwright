@@ -68,7 +68,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ model }) => {
   const [, setRevision] = React.useState(0);
   React.useEffect(() => model.subscribe(() => setRevision(r => r + 1)), [model]);
 
-  const { tabs, mode, recording, liveFrame, annotateSession, pendingCapture, debuggerPanelOpen, debuggerPaused, apiCalls } = model.state;
+  const { tabs, mode, recording, liveFrame, annotateSession, pendingCapture, debuggerPanelOpen, debuggerPaused, apiCalls, controlMessage, agentWaiting } = model.state;
   const interactive = mode === 'interactive';
   const annotateActive = !!annotateSession;
   const selectedFrame = annotateSession?.frames.find(f => f.id === annotateSession.selectedFrameId) ?? null;
@@ -313,6 +313,29 @@ export const Dashboard: React.FC<DashboardProps> = ({ model }) => {
             {debuggerPaused && <span className='debugger-paused-label'>Paused</span>}
             <div style={{ flex: 'auto' }}></div>
           </div>
+
+          {interactive && !overlayOpen && (
+            <div className='control-bar' role='region' aria-label='User control'>
+              <span className={'control-status' + (agentWaiting ? ' agent-waiting' : '')}>
+                {agentWaiting ? 'The agent is waiting for you to release control.' : 'You have control. Agent actions wait until you release it.'}
+              </span>
+              <textarea
+                className='control-message'
+                aria-label='Message for the agent'
+                placeholder='Message for the agent (optional)'
+                rows={1}
+                value={controlMessage}
+                onChange={e => model.updateControlMessage(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    model.toggleInteractive();
+                  }
+                }}
+              />
+              <button className='control-release' onClick={() => model.toggleInteractive()}>Release control</button>
+            </div>
+          )}
 
           {/* Viewport */}
           <div className='viewport-wrapper'>

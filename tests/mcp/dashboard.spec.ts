@@ -158,6 +158,50 @@ test('should allow typing in omnibox in interactive mode', async ({ cli, server,
   await expect(dashboard.locator('#omnibox')).toHaveValue(server.PREFIX + '/page2', { timeout: 10000 });
 });
 
+test('agent actions wait while the user has control', async ({ cli, server, startDashboardServer }) => {
+  server.setContent('/page1', '<html><body>Page 1</body></html>', 'text/html');
+  server.setContent('/page2', '<html><body>Page 2</body></html>', 'text/html');
+  server.setContent('/page3', '<html><body>Page 3</body></html>', 'text/html');
+  await cli('open', server.PREFIX + '/page1');
+
+  const dashboard = await startDashboardServer();
+  await dashboard.getByRole('navigation', { name: 'Sessions' }).getByRole('option').first().click();
+  await expect(dashboard.locator('#omnibox')).toHaveValue(/page1/);
+  const controlBar = dashboard.getByRole('region', { name: 'User control' });
+
+  // The user releases control without input: the command that waited runs.
+  await dashboard.getByRole('button', { name: 'Enable interactive mode' }).click();
+  const gotoPage2 = cli('goto', server.PREFIX + '/page2');
+  await expect(controlBar).toContainText('The agent is waiting');
+  await controlBar.getByRole('button', { name: 'Release control' }).click();
+  expect((await gotoPage2).exitCode).toBe(0);
+  await expect(dashboard.locator('#omnibox')).toHaveValue(server.PREFIX + '/page2');
+
+  // The user acts and leaves a message: the command that waited does not run.
+  await dashboard.getByRole('button', { name: 'Enable interactive mode' }).click();
+  const gotoPage3 = cli('goto', server.PREFIX + '/page3');
+  await expect(controlBar).toContainText('The agent is waiting');
+  await dashboard.locator('#display').click({ position: { x: 6, y: 6 } });
+  await dashboard.keyboard.type('hi');
+  await dashboard.keyboard.press('Shift+Tab');
+  await dashboard.locator('#omnibox').fill(server.PREFIX + '/page1');
+  await dashboard.locator('#omnibox').press('Enter');
+  // Snapshot is read-only, so it does not wait for the user.
+  await expect.poll(async () => (await cli('snapshot')).output).toContain('Page 1');
+  await controlBar.getByRole('textbox', { name: 'Message for the agent' }).fill('I went back to page 1, continue there');
+  await controlBar.getByRole('button', { name: 'Release control' }).click();
+  await expect(controlBar).toBeHidden();
+
+  const { output, exitCode } = await gotoPage3;
+  expect(exitCode).toBe(1);
+  expect(output).toContain('The command was not run.');
+  expect(output).toContain('Message from the user:\nI went back to page 1, continue there');
+  expect(output).toMatch(/- Clicked <\w+> "Page 2" at \(\d+, \d+\)\n- Typed "hi"\n- Pressed Shift\+Tab\n/);
+  expect(output).toContain(`- Navigated to ${server.PREFIX}/page1`);
+  expect(output).toContain(`Page URL: ${server.PREFIX}/page1`);
+  expect(output).not.toContain('/page3');
+});
+
 test('save recording streams WebM bytes to the chosen file', async ({ cli, server, startDashboardServer }) => {
   await cli('open', server.EMPTY_PAGE);
 

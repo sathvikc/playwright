@@ -15,9 +15,11 @@
  */
 
 import { EventEmitter } from 'events';
+import net from 'net';
 
 import * as z from 'zod';
 import debug from 'debug';
+import { makeSocketPath } from '@utils/fileUtils';
 import { Context } from './context';
 import { Response } from './response';
 import { SessionLog } from './sessionLog';
@@ -27,6 +29,7 @@ import type * as playwright from '../../..';
 import type { Tool } from './tool';
 import type * as mcpServer from '../utils/mcp/server';
 import type { ClientInfo, ServerBackend } from '../utils/mcp/server';
+import type { ControlResult } from '../dashboard/dashboardController';
 
 const backendDebug = debug('pw:mcp:backend');
 
@@ -123,7 +126,14 @@ export class BrowserBackend extends EventEmitter<{ disconnected: [], dynamictool
     context.setRunningTool(name);
     let responseObject: mcpServer.CallToolResult & { isClose?: boolean };
     try {
-      await handle(parsedArguments, response);
+      const touchesPage = !tool || tool.schema.type === 'input' || tool.schema.type === 'action';
+      const control: ControlResult = touchesPage ? await waitForDashboardControl(this._browserContext, signal) : { type: 'free' };
+      if (signal?.aborted)
+        return formatError('The command was cancelled while the user had control of the browser in the Playwright Dashboard.');
+      if (control.type === 'released' && (control.message || control.actions.length))
+        reportUserControl(control, response);
+      else
+        await handle(parsedArguments, response);
       for (const reason of context.drainPendingUnhandledRejections())
         response.addError(formatRejectionReason(reason));
       responseObject = await response.serialize();
@@ -140,6 +150,42 @@ export class BrowserBackend extends EventEmitter<{ disconnected: [], dynamictool
     }
     return responseObject;
   }
+}
+
+// The dashboard daemon replies when the user does not control the context. No dashboard means no user control.
+async function waitForDashboardControl(browserContext: playwright.BrowserContext, signal?: AbortSignal): Promise<ControlResult> {
+  // eslint-disable-next-line no-restricted-syntax -- _guid is the cross-process context identifier shared with the dashboard daemon.
+  const contextGuid = (browserContext as any)._guid as string;
+  return await new Promise<ControlResult>(resolve => {
+    const socket = net.connect(makeSocketPath('dashboard', 'app'));
+    const chunks: Buffer[] = [];
+    const onAbort = () => socket.destroy();
+    signal?.addEventListener('abort', onAbort);
+    const done = (result: ControlResult) => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
+    socket.on('connect', () => socket.write(JSON.stringify({ waitForControl: contextGuid }) + '\n'));
+    socket.on('data', chunk => chunks.push(chunk));
+    socket.on('error', () => done({ type: 'free' }));
+    socket.on('close', () => {
+      try {
+        const result = JSON.parse(Buffer.concat(chunks).toString());
+        done(result?.type === 'released' ? result : { type: 'free' });
+      } catch {
+        done({ type: 'free' });
+      }
+    });
+  });
+}
+
+function reportUserControl(control: Extract<ControlResult, { type: 'released' }>, response: Response) {
+  response.addError('The command was not run. The user took control of the browser in the Playwright Dashboard while the command was waiting. Read the message, the actions and the snapshot of the user, then decide the next step.');
+  if (control.message)
+    response.addTextResult(`Message from the user:\n${control.message}`);
+  if (control.actions.length)
+    response.addTextResult(`Actions of the user:\n${control.actions.map(action => `- ${action}`).join('\n')}`);
+  response.setIncludeSnapshot();
 }
 
 function formatRejectionReason(reason: unknown): string {
